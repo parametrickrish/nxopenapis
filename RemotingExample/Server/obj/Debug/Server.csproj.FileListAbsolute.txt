@@ -1,0 +1,15 @@
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\bin\Debug\Server.dll
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\bin\Debug\Server.pdb
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\bin\Debug\NXOpen.dll
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\bin\Debug\NXOpen.UF.dll
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\bin\Debug\NXOpen.Utilities.dll
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\bin\Debug\NXOpenUI.dll
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\bin\Debug\NXOpen.xml
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\bin\Debug\NXOpen.UF.xml
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\bin\Debug\NXOpen.Utilities.xml
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\bin\Debug\NXOpenUI.xml
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\obj\Debug\Server.csproj.AssemblyReference.cache
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\obj\Debug\Server.csproj.CoreCompileInputs.cache
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\obj\Debug\Server.csproj.Up2Date
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\obj\Debug\Server.dll
+P:\Courses\NX Open\NX\SampleNXOpenApplications\SampleNXOpenApplications\RemotingExample\Server\obj\Debug\Server.pdb
