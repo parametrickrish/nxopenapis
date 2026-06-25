@@ -1,0 +1,519 @@
+// ============================================================
+// NX OPEN JOURNAL — ASSEMBLY LAYER CLEANUP (PARTS + DRAWINGS)
+// ============================================================
+// WHAT THIS DOES:
+//   Starting from the assembly that is currently open, this journal finds
+//   every UNIQUE part anywhere in the assembly (including parts nested
+//   inside sub-assemblies). Each part is opened in its own window and
+//   processed only ONCE, even if it is used many times (e.g. a bolt used
+//   20 times is only opened and cleaned up once). For each part it:
+//     1. Moves datums to layer 61, sketches to layer 31, CSYS to layer 62,
+//        solid bodies to layer 1
+//     2. Hides every other layer, saves the part
+//     3. Looks for a matching drawing named "<partname>_dwg1.prt" in the
+//        same folder. If found, it moves views to layer 1, dimensions/
+//        notes/tables to layer 254, tabular notes to layer 256, locks
+//        layers 254 and 256, and saves the drawing.
+//   When everything is done, the original assembly is re-activated and
+//   saved, and a full report is written to the Info Window AND saved as
+//   a text file next to the assembly.
+//
+// HOW TO RUN:
+//   1. Open the top-level assembly in NX and make sure it is the WORK PART
+//   2. Go to File > Execute > Journal (or Tools > Journal > Play)
+//   3. Browse to this file and click OK
+//   4. The journal will open and process every part one by one — this can
+//      take a while for large assemblies. Watch the Info Window for progress.
+//
+// ASSUMPTIONS:
+//   - Each part's drawing is named "<partname>_dwg1.prt" and lives in the
+//     SAME FOLDER as the part. Change DRAWING_SUFFIX below if your naming
+//     convention is different. If a drawing isn't found, that part is
+//     still processed — the drawing step is just skipped and noted in
+//     the report.
+//   - "Locking" layers 254/256 means Visible-but-not-selectable (you can
+//     still see the annotations, you just can't pick/edit them).
+//   - "Table" objects (BOM tables, hole tables, revision tables, etc.) and
+//     "Tabular Notes" are the same underlying NXOpen object type, so both
+//     move to layer 256 together. Only true Dimension and Note objects go
+//     to layer 254.
+//   - Parts that are components of the assembly are already loaded in the
+//     NX session, so they are activated directly rather than re-opened
+//     from disk (re-opening an already-loaded part by file path causes a
+//     conflict). Drawings, which are separate files, ARE opened by path.
+//   - All part and drawing windows opened by this journal are left open
+//     at the end; close them manually if you don't need them.
+//
+// UNDO:
+//   Because this journal SAVES each part and drawing to disk as it
+//   processes them, pressing Ctrl+Z CANNOT undo files that have already
+//   been saved. If a part fails before its save, its in-session changes
+//   are rolled back and it is skipped; parts already saved earlier in the
+//   run are unaffected. Check the report at the end for exact results.
+// ============================================================
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using NXOpen;
+using NXOpen.Assemblies;
+using NXOpen.Drawings;
+using NXOpen.Layer;   // Layer.StateInfo / Layer.State live in this sub-namespace
+
+public class Journal
+{
+    // ---- EDITABLE SETTINGS -------------------------------------------
+    private const int LAYER_DATUMS = 61;                // ← CHANGE THIS if needed
+    private const int LAYER_SKETCHES = 31;               // ← CHANGE THIS if needed
+    private const int LAYER_CSYS = 62;                   // ← CHANGE THIS if needed
+    private const int LAYER_SOLID_BODIES = 1;            // ← CHANGE THIS if needed
+    private const int LAYER_VIEWS = 1;                   // ← CHANGE THIS if needed
+    private const int LAYER_ANNOTATIONS = 254;           // ← CHANGE THIS if needed
+    private const int LAYER_TABLES = 256;                // ← CHANGE THIS if needed
+    private const string DRAWING_SUFFIX = "_dwg1.prt";   // ← CHANGE THIS if your drawings use a different naming pattern
+    // --------------------------------------------------------------------
+
+    public static void Main(string[] args)
+    {
+        Session theSession = Session.GetSession();
+        ListingWindow lw = theSession.ListingWindow;
+
+        Part originalAssembly = theSession.Parts.Work;
+        if (originalAssembly == null)
+        {
+            lw.Open();
+            lw.WriteLine("No part is currently open. Please open your assembly, set it as the work part, and run this journal again.");
+            return;
+        }
+
+        string originalAssemblyPath = originalAssembly.FullPath;
+
+        ComponentAssembly compAssy = originalAssembly.ComponentAssembly;
+        Component root = compAssy.RootComponent;
+        if (root == null)
+        {
+            lw.Open();
+            lw.WriteLine("The current work part does not appear to be an assembly (no components were found).");
+            lw.WriteLine("Please open your assembly file, set it as the work part, and run this journal again.");
+            return;
+        }
+
+        Session.UndoMarkId undoMark = theSession.SetUndoMark(
+            Session.MarkVisibility.Visible,
+            "Assembly Layer Cleanup - Undo"
+        );
+
+        List<string> reportLines = new List<string>();
+        int partsOk = 0;
+        int partsErr = 0;
+        int dwgsOk = 0;
+        int dwgsErr = 0;
+        int dwgsMissing = 0;
+
+        try
+        {
+            // ── MAIN LOGIC ─────────────────────────────────────────────
+
+            List<string> visitedPaths = new List<string>();
+            List<Component> uniqueComponents = new List<Component>();
+            List<Part> uniqueParts = new List<Part>();
+            List<string> warnings = new List<string>();
+            CollectUniqueParts(root, visitedPaths, uniqueComponents, uniqueParts, warnings);
+
+            for (int w = 0; w < warnings.Count; w++)
+            {
+                reportLines.Add("WARN " + warnings[w]);
+            }
+
+            if (uniqueComponents.Count == 0)
+            {
+                lw.Open();
+                lw.WriteLine("No loaded components were found under the assembly root. Nothing to process.");
+                return;
+            }
+
+            for (int idx = 0; idx < uniqueComponents.Count; idx++)
+            {
+                Component comp = uniqueComponents[idx];
+                Part proto = uniqueParts[idx];
+                string partDisplayName = comp.DisplayName;
+                string partPath = proto.FullPath;
+                bool partOk = false;
+
+                try
+                {
+                    // The part is already loaded in the session as a component of
+                    // the assembly, so it is ACTIVATED directly rather than opened
+                    // again from disk by path.
+                    PartLoadStatus loadStatus1;
+                    theSession.Parts.SetActiveDisplay(proto, DisplayPartOption.AllowAdditional, PartDisplayPartWorkPartOption.UseLast, out loadStatus1);
+                    loadStatus1.Dispose();
+
+                    Part partWindow = theSession.Parts.Work;
+
+                    Session.UndoMarkId partMark = theSession.SetUndoMark(
+                        Session.MarkVisibility.Invisible,
+                        "Layer cleanup: " + partDisplayName
+                    );
+
+                    try
+                    {
+                        int datumCount;
+                        int sketchCount;
+                        int csysCount;
+                        int bodyCount;
+                        ProcessPartLayers(partWindow, out datumCount, out sketchCount, out csysCount, out bodyCount);
+
+                        partWindow.Save(BasePart.SaveComponents.False, BasePart.CloseAfterSave.False);
+
+                        partOk = true;
+                        partsOk = partsOk + 1;
+                        reportLines.Add("OK   PART  " + partDisplayName + "  [" + partPath + "]");
+                        reportLines.Add("           Datums->" + LAYER_DATUMS.ToString() + ": " + datumCount.ToString() +
+                                        "   Sketches->" + LAYER_SKETCHES.ToString() + ": " + sketchCount.ToString() +
+                                        "   CSYS->" + LAYER_CSYS.ToString() + ": " + csysCount.ToString() +
+                                        "   Bodies->" + LAYER_SOLID_BODIES.ToString() + ": " + bodyCount.ToString());
+                    }
+                    catch (Exception innerEx)
+                    {
+                        theSession.UndoToMark(partMark, "Rollback: " + partDisplayName);
+                        partsErr = partsErr + 1;
+                        reportLines.Add("FAIL PART  " + partDisplayName + "  [" + partPath + "]  ERROR: " + innerEx.Message);
+                    }
+                }
+                catch (Exception openEx)
+                {
+                    partsErr = partsErr + 1;
+                    reportLines.Add("FAIL PART  " + partDisplayName + "  Could not activate the part.  ERROR: " + openEx.Message);
+                }
+
+                if (partOk)
+                {
+                    string drawingPath = BuildDrawingPath(partPath);
+
+                    if (File.Exists(drawingPath))
+                    {
+                        try
+                        {
+                            PartLoadStatus loadStatus2;
+                            theSession.Parts.OpenActiveDisplay(drawingPath, DisplayPartOption.AllowAdditional, out loadStatus2);
+                            loadStatus2.Dispose();
+
+                            Part dwgWindow = theSession.Parts.Work;
+
+                            Session.UndoMarkId dwgMark = theSession.SetUndoMark(
+                                Session.MarkVisibility.Invisible,
+                                "Layer cleanup drawing: " + partDisplayName
+                            );
+
+                            try
+                            {
+                                int viewCount;
+                                int annotCount;
+                                int tableCount;
+                                ProcessDrawingLayers(dwgWindow, out viewCount, out annotCount, out tableCount);
+
+                                dwgWindow.Save(BasePart.SaveComponents.False, BasePart.CloseAfterSave.False);
+
+                                dwgsOk = dwgsOk + 1;
+                                reportLines.Add("OK   DWG   " + drawingPath);
+                                reportLines.Add("           Views->" + LAYER_VIEWS.ToString() + ": " + viewCount.ToString() +
+                                                "   Dims/Notes->" + LAYER_ANNOTATIONS.ToString() + ": " + annotCount.ToString() +
+                                                "   Tables->" + LAYER_TABLES.ToString() + ": " + tableCount.ToString());
+                            }
+                            catch (Exception dwgInnerEx)
+                            {
+                                theSession.UndoToMark(dwgMark, "Rollback drawing: " + partDisplayName);
+                                dwgsErr = dwgsErr + 1;
+                                reportLines.Add("FAIL DWG   " + drawingPath + "  ERROR: " + dwgInnerEx.Message);
+                            }
+                        }
+                        catch (Exception openDwgEx)
+                        {
+                            dwgsErr = dwgsErr + 1;
+                            reportLines.Add("FAIL DWG   " + drawingPath + "  Could not open the drawing.  ERROR: " + openDwgEx.Message);
+                        }
+                    }
+                    else
+                    {
+                        dwgsMissing = dwgsMissing + 1;
+                        reportLines.Add("---  DWG   Not found, expected at: " + drawingPath);
+                    }
+                }
+
+                reportLines.Add("");
+            }
+
+            try
+            {
+                PartLoadStatus finalStatus;
+                theSession.Parts.SetActiveDisplay(
+                    originalAssembly,
+                    DisplayPartOption.AllowAdditional,
+                    PartDisplayPartWorkPartOption.UseLast,
+                    out finalStatus
+                );
+                finalStatus.Dispose();
+                originalAssembly.Save(BasePart.SaveComponents.False, BasePart.CloseAfterSave.False);
+                reportLines.Add("Assembly re-activated and saved: " + originalAssemblyPath);
+            }
+            catch (Exception asmEx)
+            {
+                reportLines.Add("Could not re-activate/save the assembly: " + asmEx.Message);
+            }
+
+            lw.Open();
+            lw.WriteLine("========================================");
+            lw.WriteLine("  Journal: Assembly Layer Cleanup");
+            lw.WriteLine("========================================");
+            lw.WriteLine("Assembly         : " + originalAssemblyPath);
+            lw.WriteLine("Unique parts found: " + uniqueComponents.Count.ToString());
+            lw.WriteLine("Parts OK         : " + partsOk.ToString());
+            lw.WriteLine("Parts FAILED     : " + partsErr.ToString());
+            lw.WriteLine("Drawings OK      : " + dwgsOk.ToString());
+            lw.WriteLine("Drawings FAILED  : " + dwgsErr.ToString());
+            lw.WriteLine("Drawings missing : " + dwgsMissing.ToString());
+            lw.WriteLine("----------------------------------------");
+            for (int r = 0; r < reportLines.Count; r++)
+            {
+                lw.WriteLine(reportLines[r]);
+            }
+            lw.WriteLine("----------------------------------------");
+
+            try
+            {
+                string asmDir = Path.GetDirectoryName(originalAssemblyPath);
+                string asmNameNoExt = Path.GetFileNameWithoutExtension(originalAssemblyPath);
+                string reportPath = asmDir + "\\" + asmNameNoExt + "_LayerCleanupReport.txt";
+
+                string fileText = "";
+                fileText = fileText + "Assembly Layer Cleanup Report" + Environment.NewLine;
+                fileText = fileText + "Assembly: " + originalAssemblyPath + Environment.NewLine;
+                fileText = fileText + "Run date: " + DateTime.Now.ToString() + Environment.NewLine;
+                fileText = fileText + "Parts OK / FAILED: " + partsOk.ToString() + " / " + partsErr.ToString() + Environment.NewLine;
+                fileText = fileText + "Drawings OK / FAILED / Missing: " + dwgsOk.ToString() + " / " + dwgsErr.ToString() + " / " + dwgsMissing.ToString() + Environment.NewLine;
+                fileText = fileText + "----------------------------------------" + Environment.NewLine;
+                for (int r2 = 0; r2 < reportLines.Count; r2++)
+                {
+                    fileText = fileText + reportLines[r2] + Environment.NewLine;
+                }
+
+                File.WriteAllText(reportPath, fileText);
+                lw.WriteLine("Full report also saved to: " + reportPath);
+            }
+            catch (Exception fileEx)
+            {
+                lw.WriteLine("Could not save the report text file: " + fileEx.Message);
+            }
+
+            lw.WriteLine("All part and drawing windows opened by this journal remain open in NX.");
+            lw.WriteLine("Use File > Close All if you want to close them.");
+            lw.WriteLine("========================================");
+            // ───────────────────────────────────────────────────────────
+        }
+        catch (Exception ex)
+        {
+            theSession.UndoToMark(undoMark, "Assembly Layer Cleanup - Rollback");
+
+            lw.Open();
+            lw.WriteLine("X ERROR - Assembly Layer Cleanup did not complete.");
+            lw.WriteLine("  Reason: " + ex.Message);
+            lw.WriteLine("  NOTE: any parts or drawings already saved to disk before this error");
+            lw.WriteLine("  occurred are NOT reversed by this rollback (a disk save cannot be undone).");
+            lw.WriteLine("  Check any partial results printed above before re-running.");
+        }
+    }
+
+    private static void CollectUniqueParts(Component parentComp, List<string> visitedPaths, List<Component> uniqueComponents, List<Part> uniqueParts, List<string> warnings)
+    {
+        Component[] children = parentComp.GetChildren();
+        for (int i = 0; i < children.Length; i++)
+        {
+            Component child = children[i];
+            if (child == null)
+            {
+                continue;
+            }
+
+            Part proto = child.Prototype as Part;
+            if (proto == null)
+            {
+                warnings.Add("Component '" + child.DisplayName + "' has no loaded part (unloaded or suppressed) - skipped.");
+                continue;
+            }
+
+            string childPath = proto.FullPath;
+            bool alreadyVisited = false;
+            for (int j = 0; j < visitedPaths.Count; j++)
+            {
+                if (string.Equals(visitedPaths[j], childPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    alreadyVisited = true;
+                    break;
+                }
+            }
+
+            if (!alreadyVisited)
+            {
+                visitedPaths.Add(childPath);
+                uniqueComponents.Add(child);
+                uniqueParts.Add(proto);
+                CollectUniqueParts(child, visitedPaths, uniqueComponents, uniqueParts, warnings);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Moves datums, sketches, CSYS, and solid bodies to their target layers,
+    // then hides every layer except the solid body layer.
+    // NOTE: thePart.Datums contains DatumPlane and DatumAxis objects. The
+    // loop variable type is DisplayableObject (not "Datum") because
+    // NXOpen.Annotations also has an unrelated class literally named
+    // "Datum" (used for GD&T datum symbols) - using "Datum" as the type
+    // here would silently bind to the wrong class and throw a cast error
+    // at runtime.
+    // -------------------------------------------------------------------
+    private static void ProcessPartLayers(Part thePart, out int datumCount, out int sketchCount, out int csysCount, out int bodyCount)
+    {
+        List<DisplayableObject> datumList = new List<DisplayableObject>();
+        foreach (DisplayableObject d in thePart.Datums)
+        {
+            datumList.Add(d);
+        }
+        datumCount = datumList.Count;
+        if (datumCount > 0)
+        {
+            thePart.Layers.MoveDisplayableObjects(LAYER_DATUMS, datumList.ToArray());
+        }
+
+        List<DisplayableObject> sketchList = new List<DisplayableObject>();
+        foreach (Sketch sk in thePart.Sketches)
+        {
+            sketchList.Add(sk);
+        }
+        sketchCount = sketchList.Count;
+        if (sketchCount > 0)
+        {
+            thePart.Layers.MoveDisplayableObjects(LAYER_SKETCHES, sketchList.ToArray());
+        }
+
+        List<DisplayableObject> csysList = new List<DisplayableObject>();
+        foreach (CartesianCoordinateSystem cs in thePart.CoordinateSystems)
+        {
+            csysList.Add(cs);
+        }
+        csysCount = csysList.Count;
+        if (csysCount > 0)
+        {
+            thePart.Layers.MoveDisplayableObjects(LAYER_CSYS, csysList.ToArray());
+        }
+
+        List<DisplayableObject> bodyList = new List<DisplayableObject>();
+        foreach (Body b in thePart.Bodies)
+        {
+            if (b.IsSolidBody)
+            {
+                bodyList.Add(b);
+            }
+        }
+        bodyCount = bodyList.Count;
+        if (bodyCount > 0)
+        {
+            thePart.Layers.MoveDisplayableObjects(LAYER_SOLID_BODIES, bodyList.ToArray());
+        }
+
+        // Try to make the solid body layer the work layer. Some parts (e.g.
+        // assembly-only files with no geometry of their own) don't accept
+        // this assignment - that's fine, it isn't required for ChangeStates
+        // below to work, so a failure here is silently ignored.
+        //bool workLayerSet = false;
+
+        try
+        {
+            thePart.Layers.WorkLayer = LAYER_SOLID_BODIES;
+            //workLayerSet = true;
+
+        }
+        catch
+        {
+            // Part has no geometry and no settable work layer (e.g. a sub-assembly
+            // that only holds components). Skip the layer visibility change.
+        }
+
+        //if (workLayerSet)
+        //{
+            StateInfo[] stateArray = new StateInfo[256];
+            for (int i = 0; i < 256; i++)
+            {
+                int layerNum = i + 1;
+                if (layerNum == LAYER_SOLID_BODIES)
+                {
+                    stateArray[i] = new StateInfo(layerNum, State.WorkLayer);
+                }
+                else
+                {
+                    stateArray[i] = new StateInfo(layerNum, State.Hidden);
+                }
+            }
+            thePart.Layers.ChangeStates(stateArray, false);
+        //}
+    }
+
+    private static void ProcessDrawingLayers(Part dwgPart, out int viewCount, out int annotCount, out int tableCount)
+    {
+        viewCount = 0;
+        foreach (DrawingSheet sheet in dwgPart.DrawingSheets)
+        {
+            DraftingView[] views = sheet.GetDraftingViews();
+            for (int i = 0; i < views.Length; i++)
+            {
+                //views[i].Layer = LAYER_VIEWS;
+                viewCount = viewCount + 1;
+            }
+        }
+
+        List<DisplayableObject> annotList = new List<DisplayableObject>();
+        foreach (NXOpen.Annotations.Dimension dim in dwgPart.Dimensions)
+        {
+            annotList.Add(dim);
+        }
+        foreach (NXOpen.Annotations.Note nt in dwgPart.Notes)
+        {
+            annotList.Add(nt);
+        }
+        annotCount = annotList.Count;
+        if (annotCount > 0)
+        {
+            dwgPart.Layers.MoveDisplayableObjects(LAYER_ANNOTATIONS, annotList.ToArray());
+        }
+
+        List<DisplayableObject> tableList = new List<DisplayableObject>();
+        foreach (NXOpen.Annotations.Table tbl in dwgPart.Annotations.Tables)
+        {
+            tableList.Add(tbl);
+        }
+        tableCount = tableList.Count;
+        if (tableCount > 0)
+        {
+            dwgPart.Layers.MoveDisplayableObjects(LAYER_TABLES, tableList.ToArray());
+        }
+
+        StateInfo[] lockArray = new StateInfo[3];
+        lockArray[0] = new StateInfo(LAYER_ANNOTATIONS, State.Visible);
+        lockArray[1] = new StateInfo(LAYER_TABLES, State.Visible);
+        lockArray[2] = new StateInfo(LAYER_VIEWS, State.Selectable);
+        dwgPart.Layers.ChangeStates(lockArray, false);
+    }
+
+    private static string BuildDrawingPath(string partFullPath)
+    {
+        string directory = Path.GetDirectoryName(partFullPath);
+        string nameNoExt = Path.GetFileNameWithoutExtension(partFullPath);
+        return directory + "\\" + nameNoExt + DRAWING_SUFFIX;
+    }
+
+    public static int GetUnloadOption(string dummy)
+    {
+        return (int)Session.LibraryUnloadOption.Immediately;
+    }
+}
